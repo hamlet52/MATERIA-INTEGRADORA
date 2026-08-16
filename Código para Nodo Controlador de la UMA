@@ -1,0 +1,379 @@
+//Es necesario mencionar que este código, se emplea en una ESP32 de 32 pines, en donde la variable de Celda Peltier se usó para //fines de evaluación del prototipo, es decir, no forma parte de la lógica real de la UMA, adicional, para que el código funciona la //esp32, debe ser montada en un shield basado en RS485, adquirido en el siguiente enlace:
+//https://es.aliexpress.com/item/1005008483161283.html?gatewayAdapt=glo2esp
+//Su programación se realizó en ARDUINO IDE
+
+// ============================================================================
+//                    1. LIBRERÍAS Y DEPENDENCIAS
+// ============================================================================
+#include <ModbusRTU.h>        // Librería para la gestión del protocolo de comunicación Modbus RTU (Esclavo/Maestro)
+#include <OneWire.h>          // Librería para la comunicación mediante el protocolo OneWire (usado por el sensor DS18B20)
+#include <DallasTemperature.h> // Librería que facilita la lectura de sensores de temperatura Dallas/Maxim (DS18B20)
+
+// ============================================================================
+//                2. VARIABLES GLOBALES DE CONTROL
+// ============================================================================
+uint8_t valorDac = 0; // Variable global de 8 bits (0-255) para almacenar el nivel actual de la salida analógica (DAC)
+
+// ============================================================================
+//             3. ASIGNACIÓN DE PINES Y HARDWARE (MAPA DE E/S)
+// ============================================================================
+// --- Configuración Transceptor RS-485 ---
+#define PIN_RX_SLAVE1    3 // GPIO3 (RX0 por defecto): Conexión al pin RO (Receiver Output) del módulo MAX485
+#define PIN_TX_SLAVE1    1 // GPIO1 (TX0 por defecto): Conexión al pin DI (Driver Input) del módulo MAX485
+#define PIN_RE_DE_SLAVE1 22 // GPIO22: Conexión combinada a los pines RE/DE del MAX485 para controlar la dirección del flujo (TX/RX)
+
+// --- Entradas Digitales (Sensores / Selectores) ---
+#define PIN_FILTRO_SUCIO   33 // GPIO33: Entrada digital conectada al presostato diferencial del filtro de aire
+#define PIN_VENT_DI        32 // GPIO32: Entrada digital para confirmación de estado/retroalimentación (Feedback) del ventilador
+#define PIN_MODO_MANUAL    15 // GPIO15: Entrada digital conectada a la posición "MANUAL" del selector físico
+#define PIN_MODO_AUTO      2  // GPIO2: Entrada digital conectada a la posición "AUTO" del selector físico
+
+// --- Salidas Digitales (Actuadores Relé) ---
+#define PIN_VENT_DO        27 // GPIO27: Salida digital para activar la bobina del relé/contactor del ventilador
+#define PIN_CELDA_PELTIER  13 // GPIO13: Salida digital para activar el relé/MOSFET de la celda Peltier/etapa de potencia
+
+// --- Entradas Analógicas ---
+#define PIN_FEEDBACK_ADC   36 // GPIO36 (VP): Entrada analógica (ADC1_CH0) para monitorear la posición real de la válvula
+#define PIN_DS18B20        23 // GPIO23: Pin de bus de datos digital para el sensor de temperatura Dallas DS18B20
+
+// --- Salidas Analógicas ---
+#define PIN_DAC_VALVULA    26 // GPIO26: Salida analógica DAC2 nativa del ESP32 para controlar la apertura de la válvula modulante (0-255)
+
+// ============================================================================
+//            4. DIRECCIONAMIENTO REGISTROS MODBUS (4X - HOLDING)
+// ============================================================================
+#define SLAVE_ID_UMA        1   // Identificador de nodo único (Dirección de esclavo Modbus) asignado a la UMA
+
+// --- Control y Comandos (Escritura/Lectura por Master) ---
+#define HR_VENT_ON             1  // Registro 40002: Comando de encendido/apagado manual del ventilador (0=OFF, 1=ON)
+#define HR_VENT_HORARIO        2  // Registro 40003: Comando de encendido/apagado por programación horaria global del BMS (0=OFF, 1=ON)
+#define HR_VENT_HORARIOMANUAL  3  // Registro 40004: Comando de encendido/apagado por programación horaria en modo manual (0=OFF, 1=ON)
+
+// --- Setpoints y Temperaturas Configurables ---
+#define HR_SETPOINT_ENT        4  // Registro 40005: Punto de consigna del termostato local (valor multiplicado x100)
+#define HR_TEMP_AMBIENTE       5  // Registro 40006: Temperatura ambiente enviada o leída desde la red (valor x100)
+#define HR_SETPOINT_FUXA       6  // Registro 40007: Punto de consigna configurado desde el SCADA/HMI Fuxa (valor x100)
+
+// --- Estados de Entradas Digitales Físicas ---
+#define HR_FILTRO_SUCIO        7  // Registro 40008: Reflejo en red del presostato del filtro (0=Limpio, 1=Sucio)
+#define HR_VENT_FEEDBACK       8  // Registro 40009: Reflejo en red de la confirmación física del ventilador (0=Detenido, 1=Girando)
+#define HR_MODO_MANUAL         9  // Registro 40010: Reflejo en red del selector físico en MANUAL (0=Inactivo, 1=Activo)
+#define HR_MODO_AUTO           10 // Registro 40011: Reflejo en red del selector físico en AUTO (0=Inactivo, 1=Activo)
+
+// --- Datos de Sensores y Variables Calculadas ---
+#define HR_TEMP_RETORNO        11 // Registro 40012: Lectura real del sensor DS18B20 en el retorno de aire (valor x100)
+#define HR_VALV_POS            12 // Registro 40013: Porcentaje de apertura simulado/calculado de la válvula (0 - 100%)
+#define HR_SETPOINT_ACTIVO     13 // Registro 40014: Consigna activa en uso tras la evaluación de prioridades (valor x100)
+
+// ============================================================================
+//            5. INSTANCIACIÓN DE OBJETOS Y VARIABLES AUXILIARES
+// ============================================================================
+HardwareSerial SerialEsclavo(1);     // Instancia del puerto serie UART1 interno del ESP32
+ModbusRTU mbEsclavo;                 // Instancia de la clase para gestionar la pila del protocolo Modbus RTU
+OneWire oneWire(PIN_DS18B20);        // Instancia del controlador de bus OneWire asignado al GPIO23
+DallasTemperature sensors(&oneWire); // Instancia de la librería Dallas asignada al bus OneWire creado
+
+// Variables de memoria previa para detección de flancos en los setpoints
+uint16_t ultimoSetpointEnt = 0;  // Guarda el último valor conocido de consigna del termostato para detectar cambios
+uint16_t ultimoSetpointFuxa = 0; // Guarda el último valor conocido de consigna de Fuxa para detectar cambios
+
+// Declaración de los manipuladores ("Handles") para las tareas concurrentes de FreeRTOS
+TaskHandle_t TaskLecturaHandle = NULL; // Manejador de la tarea en Núcleo 0 (Monitoreo/Sensores)
+TaskHandle_t TaskModbusHandle = NULL;  // Manejador de la tarea en Núcleo 1 (Comunicaciones/Control)
+
+// Prototipos de las funciones que ejecutarán los hilos de FreeRTOS
+void tareaLecturaSensores(void *pvParameters); // Función que se ejecutará en la tarea de lectura
+void tareaModbusEscucha(void *pvParameters);  // Función que se ejecutará en la tarea de comunicación y control
+
+// ============================================================================
+//               6. INICIALIZACIÓN DEL SISTEMA (SETUP)
+// ============================================================================
+void setup() {
+  Serial.begin(115200); // Inicializa el puerto UART0 por USB para depuración por Monitor Serie a 115200 baudios
+  delay(1000);          // Pausa de seguridad de 1 segundo para la estabilización del voltaje de alimentación
+
+  Serial.println("\n--- INICIANDO ESP32 UMA (MODBUS ESCLAVO - SOLO HR) ---"); // Mensaje informativo inicial
+
+  // Configuración de modos de funcionamiento para las salidas digitales
+  pinMode(PIN_VENT_DO, OUTPUT);       // Define el pin del relé del ventilador como SALIDA
+  pinMode(PIN_CELDA_PELTIER, OUTPUT); // Define el pin de control de la celda Peltier como SALIDA
+
+  // Configuración de modos para entradas digitales usando resistencias internas Pulldown (0V en reposo)
+  pinMode(PIN_FILTRO_SUCIO, INPUT_PULLDOWN); // Define la entrada de presostato con Pulldown
+  pinMode(PIN_VENT_DI, INPUT_PULLDOWN);      // Define la entrada de feedback del ventilador con Pulldown
+  pinMode(PIN_MODO_MANUAL, INPUT_PULLDOWN);  // Define la entrada del selector Manual con Pulldown
+  pinMode(PIN_MODO_AUTO, INPUT_PULLDOWN);    // Define la entrada del selector Auto con Pulldown
+
+  // Configuración de pines analógicos y sensores
+  pinMode(PIN_FEEDBACK_ADC, INPUT);   // Configura el pin del ADC como entrada pura para lectura analógica
+
+  // Configuración de la red Modbus RTU RS-485
+  SerialEsclavo.begin(9600, SERIAL_8N1, PIN_RX_SLAVE1, PIN_TX_SLAVE1); // Inicializa la UART1 a 9600 bps, 8 bits de datos, sin paridad, 1 bit de parada
+  mbEsclavo.begin(&SerialEsclavo, PIN_RE_DE_SLAVE1);                   // Vincula el objeto Modbus a la UART1 y configura el pin de control de flujo
+  mbEsclavo.slave(SLAVE_ID_UMA);                                       // Asigna el número de esclavo ID=1 al ESP32 en la red RS-485
+
+  // --- Inicialización y Mapeo de Registros Modbus (Holding Registers 4X) ---
+  mbEsclavo.addHreg(HR_VENT_ON, 0);            // Asigna dirección HR 1, valor inicial = 0 (OFF)
+  mbEsclavo.addHreg(HR_VENT_HORARIO, 0);       // Asigna dirección HR 2, valor inicial = 0 (OFF)
+  mbEsclavo.addHreg(HR_VENT_HORARIOMANUAL, 0); // Asigna dirección HR 3, valor inicial = 0 (OFF)
+  
+  mbEsclavo.addHreg(HR_SETPOINT_ENT, 2200);    // Asigna dirección HR 4, valor inicial = 2200 (22.00 °C)
+  mbEsclavo.addHreg(HR_SETPOINT_FUXA, 2200);   // Asigna dirección HR 6, valor inicial = 2200 (22.00 °C)
+  mbEsclavo.addHreg(HR_TEMP_AMBIENTE, 2500);  // Asigna dirección HR 5, valor inicial = 2500 (25.00 °C)
+  
+  mbEsclavo.addHreg(HR_FILTRO_SUCIO, 0);       // Asigna dirección HR 7, valor inicial = 0 (Limpio)
+  mbEsclavo.addHreg(HR_VENT_FEEDBACK, 0);      // Asigna dirección HR 8, valor inicial = 0 (Sin flujo)
+  mbEsclavo.addHreg(HR_MODO_MANUAL, 0);        // Asigna dirección HR 9, valor inicial = 0 (Inactivo)
+  mbEsclavo.addHreg(HR_MODO_AUTO, 0);          // Asigna dirección HR 10, valor inicial = 0 (Inactivo)
+  
+  mbEsclavo.addHreg(HR_TEMP_RETORNO, 2500);    // Asigna dirección HR 11, valor inicial = 2500 (25.00 °C)
+  mbEsclavo.addHreg(HR_VALV_POS, 0);           // Asigna dirección HR 12, valor inicial = 0 (0% Cerrada)
+  mbEsclavo.addHreg(HR_SETPOINT_ACTIVO, 2200); // Asigna dirección HR 13, valor inicial = 2200 (22.00 °C)
+  
+  sensors.begin(); // Inicializa las lecturas del bus de sensores de temperatura Dallas
+
+  // --- Creación y Distribución de Tareas Multinúcleo FreeRTOS ---
+  // Tarea 1: Asignada al NÚCLEO 0 (Lectura de hardware y telemetría por consola)
+  xTaskCreatePinnedToCore(
+    tareaLecturaSensores, // Función que ejecuta la tarea
+    "TaskLectura",        // Nombre alfanumérico para identificación interna
+    4096,                 // Tamaño de la pila asignada (Stack size en Bytes)
+    NULL,                 // Parámetros de entrada a la tarea (no se usan)
+    1,                    // Prioridad de la tarea (1 = Baja/Media)
+    &TaskLecturaHandle,   // Puntero para manipular la tarea
+    0                     // Núcleo del ESP32 donde se ejecutará (CORE 0)
+  );
+
+  // Tarea 2: Asignada al NÚCLEO 1 (Escucha de red Modbus y algoritmo de control)
+  xTaskCreatePinnedToCore(
+    tareaModbusEscucha,  // Función que ejecuta la tarea
+    "TaskModbus",         // Nombre alfanumérico de la tarea
+    4096,                 // Tamaño de la pila asignada
+    NULL,                 // Parámetros de entrada
+    2,                    // Prioridad de la tarea (2 = Alta prioridad)
+    &TaskModbusHandle,    // Puntero para manipular la tarea
+    1                     // Núcleo del ESP32 donde se ejecutará (CORE 1)
+  );
+}
+
+// ============================================================================
+//                 7. BUCLE PRINCIPAL (DESACTIVADO EN FREERTOS)
+// ============================================================================
+void loop() {
+  vTaskDelete(NULL); // Elimina el loop() por defecto para liberar memoria, ya que se usan tareas explícitas
+}
+
+// ============================================================================
+//  8. TAREA NÚCLEO 0: Lectura de Sensores y Monitor de Consola Estructurado
+// ============================================================================
+void tareaLecturaSensores(void *pvParameters) {
+  TickType_t xLastWakeTime;                      // Variable para almacenar el instante de tiempo de la última ejecución
+  const TickType_t xFrequency = pdMS_TO_TICKS(2000); // Convierte 2000 milisegundos al equivalente en ticks del sistema operativo
+  xLastWakeTime = xTaskGetTickCount();           // Obtiene el tiempo actual de ticks en el momento de arranque
+
+  for (;;) { // Bucle infinito que mantiene viva la tarea
+    // 1. Leer entradas físicas y actualizar registros Holding
+    bool filtro = digitalRead(PIN_FILTRO_SUCIO); // Captura el estado lógico (HIGH/LOW) del presostato del filtro
+    bool ventFB = digitalRead(PIN_VENT_DI);        // Captura el estado del contacto auxiliar de retroalimentación del ventilador
+    bool mManual = digitalRead(PIN_MODO_MANUAL);   // Captura la posición física del selector en MODO MANUAL
+    bool mAuto = digitalRead(PIN_MODO_AUTO);       // Captura la posición física del selector en MODO AUTOMÁTICO
+
+    mbEsclavo.Hreg(HR_FILTRO_SUCIO, filtro ? 1 : 0); // Almacena un 1 o 0 en el registro Modbus según la lectura del filtro
+    mbEsclavo.Hreg(HR_VENT_FEEDBACK, ventFB ? 1 : 0); // Almacena el estado de giro del ventilador en el registro Modbus
+    mbEsclavo.Hreg(HR_MODO_MANUAL, mManual ? 1 : 0);  // Actualiza en Modbus si el interruptor físico está en MANUAL
+    mbEsclavo.Hreg(HR_MODO_AUTO, mAuto ? 1 : 0);      // Actualiza en Modbus si el interruptor físico está en AUTO
+    
+    int rawAdc = analogRead(PIN_FEEDBACK_ADC);              // Realiza la conversión A/D de la entrada analógica del ADC
+    int posicion = map(valorDac, 0, 255, 0, 100);          // Mapea y escala la salida del DAC (0-255) a porcentaje de apertura (0-100%)
+    mbEsclavo.Hreg(HR_VALV_POS, posicion);                 // Guarda el porcentaje de apertura calculado en la tabla Modbus
+
+    sensors.requestTemperatures();                  // Envía la orden de conversión de temperatura a todos los sensores DS18B20
+    float t = sensors.getTempCByIndex(0);            // Lee el valor en grados Celsius del primer sensor DS18B20 hallado
+    if (t != DEVICE_DISCONNECTED_C) {                // Verifica que la lectura sea válida y que el sensor esté conectado
+      int16_t tempEscalada = (int16_t)(t * 100.0f + 0.5f); // Redondea y escala la temperatura a valor entero x100 (ej: 25.34°C -> 2534)
+      mbEsclavo.Hreg(HR_TEMP_RETORNO, tempEscalada); // Actualiza la temperatura de retorno en el registro Modbus
+    }
+
+    // 2. Extraer valores actuales de todos los Holding Registers para el reporte
+    uint16_t hrVentOn             = mbEsclavo.Hreg(HR_VENT_ON);             // Lee orden de ventilación manual
+    uint16_t hrVentHorario        = mbEsclavo.Hreg(HR_VENT_HORARIO);        // Lee orden de ventilación por horario global
+    uint16_t hrVentHorarioM       = mbEsclavo.Hreg(HR_VENT_HORARIOMANUAL);  // Lee orden de ventilación por horario manual
+
+    uint16_t hrSpEnt              = mbEsclavo.Hreg(HR_SETPOINT_ENT);        // Lee consigna proveniente del termostato
+    uint16_t hrSpFuxa             = mbEsclavo.Hreg(HR_SETPOINT_FUXA);       // Lee consigna proveniente del SCADA Fuxa
+    uint16_t hrTempAmb            = mbEsclavo.Hreg(HR_TEMP_AMBIENTE);       // Lee la temperatura ambiente registrada
+
+    uint16_t hrFiltroSucio        = mbEsclavo.Hreg(HR_FILTRO_SUCIO);        // Lee el estado del registro del filtro
+    uint16_t hrVentFb             = mbEsclavo.Hreg(HR_VENT_FEEDBACK);       // Lee el estado del registro de feedback del ventilador
+    uint16_t hrManual             = mbEsclavo.Hreg(HR_MODO_MANUAL);         // Lee el estado de la bandera de modo manual
+    uint16_t hrAuto               = mbEsclavo.Hreg(HR_MODO_AUTO);           // Lee el estado de la bandera de modo automático
+
+    uint16_t hrTempRet            = mbEsclavo.Hreg(HR_TEMP_RETORNO);        // Lee la temperatura del sensor de retorno física
+    uint16_t hrValvPos            = mbEsclavo.Hreg(HR_VALV_POS);            // Lee la posición porcentual de la válvula
+    uint16_t hrSpActivo           = mbEsclavo.Hreg(HR_SETPOINT_ACTIVO);     // Lee el setpoint que está operando en la lógica
+
+    // 3. Imprimir reporte clasificado de diagnóstico por consola serie
+    Serial.println("\n================================================================");
+    Serial.println("           ESTADISTICAS DE RED MODBUS (TODOS 4X - HR)            ");
+    Serial.println("================================================================");
+    
+    Serial.println("[ORDENES / CONTROL MASTER]");
+    Serial.printf("  * (HR%d) Ventilación Manual ON/OFF : %s (%d)\n", HR_VENT_ON, hrVentOn ? "ENCENDIDO" : "APAGADO", hrVentOn);
+    Serial.printf("  * (HR%d) Ventilación Horario Global: %s (%d)\n", HR_VENT_HORARIO, hrVentHorario ? "ENCENDIDO" : "APAGADO", hrVentHorario);
+    Serial.printf("  * (HR%d) Ventilación Horario Manual: %s (%d)\n", HR_VENT_HORARIOMANUAL, hrVentHorarioM ? "ENCENDIDO" : "APAGADO", hrVentHorarioM);
+    Serial.printf("  * (HR%d) SP Termostato             : %.2f °C (%d)\n", HR_SETPOINT_ENT, hrSpEnt / 100.0f, hrSpEnt);
+    Serial.printf("  * (HR%d) SP Fuxa                   : %.2f °C (%d)\n", HR_SETPOINT_FUXA, hrSpFuxa / 100.0f, hrSpFuxa);
+    Serial.printf("  * (HR%d) Temp Ambiente             : %.2f °C (%d)\n", HR_TEMP_AMBIENTE, hrTempAmb / 100.0f, hrTempAmb);
+    Serial.println("----------------------------------------------------------------");
+
+    Serial.println("[ESTADOS DE ENTRADAS FÍSICAS Y LECTURAS]");
+    Serial.printf("  * (HR%d) Filtro Sucio              : %s (%d)\n", HR_FILTRO_SUCIO, hrFiltroSucio ? "ACTIVO" : "INACTIVO", hrFiltroSucio);
+    Serial.printf("  * (HR%d) Ventilador Feedback       : %s (%d)\n", HR_VENT_FEEDBACK, hrVentFb ? "ACTIVO" : "INACTIVO", hrVentFb);
+    Serial.printf("  * (HR%d) Modo Manual               : %s (%d)\n", HR_MODO_MANUAL, hrManual ? "ACTIVO" : "INACTIVO", hrManual);
+    Serial.printf("  * (HR%d) Modo Auto                 : %s (%d)\n", HR_MODO_AUTO, hrAuto ? "ACTIVO" : "INACTIVO", hrAuto);
+    Serial.printf("  * (HR%d) Temp Retorno Física       : %.2f °C (%d)\n", HR_TEMP_RETORNO, hrTempRet / 100.0f, hrTempRet);
+    Serial.printf("  * (HR%d) Posición Válvula          : %d %%\n", HR_VALV_POS, hrValvPos);
+    Serial.printf("  * (HR%d) SP Activo                 : %.2f °C (%d)\n", HR_SETPOINT_ACTIVO, hrSpActivo / 100.0f, hrSpActivo);
+    Serial.println("================================================================");
+
+    // Pausa la tarea de forma precisa garantizando un periodo de 2000 ms exactos entre ejecuciones
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
+// ============================================================================
+//  9. TAREA NÚCLEO 1: Gestión de Red Modbus, Setpoints y Control Progresivo
+// ============================================================================
+void tareaModbusEscucha(void *pvParameters) {
+  ultimoSetpointEnt = mbEsclavo.Hreg(HR_SETPOINT_ENT);   // Carga inicial para el rastreador del setpoint del termostato
+  ultimoSetpointFuxa = mbEsclavo.Hreg(HR_SETPOINT_FUXA); // Carga inicial para el rastreador del setpoint de Fuxa
+
+  for (;;) { // Bucle de control continuo
+    mbEsclavo.task(); // Procesa activamente las tramas entrantes de la red RS-485 Modbus y responde al Maestro
+
+    // 1. LÓGICA DE SELECCIÓN Y SOBREESCRITURA DE SETPOINT ACTIVO (PRIORIDAD POR CAMBIO)
+    uint16_t actualEnt = mbEsclavo.Hreg(HR_SETPOINT_ENT);   // Obtiene la consigna actual guardada en la dirección HR4
+    uint16_t actualFuxa = mbEsclavo.Hreg(HR_SETPOINT_FUXA); // Obtiene la consigna actual guardada en la dirección HR6
+
+    // Evalúa si el Maestro escribió un nuevo valor en el Setpoint del Termostato
+    if (actualEnt != ultimoSetpointEnt) {
+      ultimoSetpointEnt = actualEnt;                       // Actualiza el registro de memoria previa
+      mbEsclavo.Hreg(HR_SETPOINT_ACTIVO, actualEnt);        // Transfiere el nuevo valor al Setpoint Activo del sistema
+      Serial.printf("\n[MODBUS RX] ¡Cambio de SP Termostato desde Master!: %.2f °C\n", actualEnt / 100.0f);
+    } 
+    
+    // Evalúa si el Maestro escribió un nuevo valor en el Setpoint de Fuxa
+    if (actualFuxa != ultimoSetpointFuxa) {
+      ultimoSetpointFuxa = actualFuxa;                     // Actualiza el registro de memoria previa
+      mbEsclavo.Hreg(HR_SETPOINT_ACTIVO, actualFuxa);       // Otorga la prioridad al último valor escrito asignándolo al Setpoint Activo
+      Serial.printf("\n[MODBUS RX] ¡Cambio de SP FUXA desde Master!: %.2f °C\n", actualFuxa / 100.0f);
+    }
+
+    // 2. Leer estados de Modos de Operación y Banderas
+    bool manual = mbEsclavo.Hreg(HR_MODO_MANUAL) > 0;                     // Flag de confirmación para MODO MANUAL
+    bool automatico = mbEsclavo.Hreg(HR_MODO_AUTO) > 0;                   // Flag de confirmación para MODO AUTOMÁTICO
+    bool estadoVentilador = mbEsclavo.Hreg(HR_VENT_ON) > 0;             // Estado del botón/comando manual del ventilador
+    bool estadoVentiladorHorario = mbEsclavo.Hreg(HR_VENT_HORARIO) > 0; // Estado del horario programado global
+    bool estadoVentiladorHorarioM = mbEsclavo.Hreg(HR_VENT_HORARIOMANUAL) > 0; // Estado del horario en modo manual
+
+    // 3. REGLA GENERAL DE APAGADO DE SEGURIDAD (INTERLOCK)
+    bool alMenunoEncendido = estadoVentilador || estadoVentiladorHorario || estadoVentiladorHorarioM; // Retorna verdadero si hay al menos una orden de marcha
+
+    if (!alMenunoEncendido) { // Si no existe NINGUNA orden de encendido activa en el sistema:
+        valorDac = 0;                         // Borra el registro global de nivel de DAC
+        static float dacFlotante = 0.0f;       // Variable estática local para almacenar la rampa de bajada
+        dacFlotante = 0.0f;                   // Reinicia la variable flotante acumuladora a cero
+        digitalWrite(PIN_VENT_DO, LOW);       // Desconecta la salida digital del relé del ventilador
+        digitalWrite(PIN_CELDA_PELTIER, LOW); // Desconecta la salida del relé de la Celda Peltier
+        dacWrite(PIN_DAC_VALVULA, 0);         // Fuerza a 0V la salida analógica DAC (cierra la válvula)
+    } 
+    else { // Si existe permiso de marcha del ventilador, procesa las condiciones operativas:
+        bool permitirControlDac = false; // Variable local de enclavamiento para autorizar la modulación
+
+        // Evaluar reglas de exclusividad según el modo seleccionado
+        if (automatico) {
+            permitirControlDac = true; // En modo automático se habilita la regulación analógica
+        } 
+        else if (manual) {
+            // Regla de exclusividad lógica XOR en manual (Activo si la orden manual u horario están presentes, pero no ambos)
+            bool reglaExclusividadManual = (estadoVentiladorHorarioM && !estadoVentilador) || 
+                                           (!estadoVentiladorHorarioM && estadoVentilador);
+            
+            if (reglaExclusividadManual) {
+                permitirControlDac = true; // Habilita el control de la válvula al cumplirse la condición lógica manual
+            }
+        }
+
+        // Lógica de regulación por histéresis y rampa de enfriamiento
+        if (permitirControlDac) {
+            uint16_t setpointActivoRaw = mbEsclavo.Hreg(HR_SETPOINT_ACTIVO); // Lee el valor crudo x100 de la consigna activa
+            uint16_t tempAmbRaw = mbEsclavo.Hreg(HR_TEMP_AMBIENTE);          // Lee el valor crudo x100 de la temperatura ambiente
+
+            float spActivoC = setpointActivoRaw / 100.0f; // Convierte de int16_t a grados Celsius flotantes
+            float tempAmbC = tempAmbRaw / 100.0f;         // Convierte de int16_t a grados Celsius flotantes
+
+            // Acotamiento por software (Saturación/Límites de seguridad)
+            if (spActivoC < 16.0f) spActivoC = 16.0f; // Limita el setpoint mínimo a 16.0 °C
+            if (spActivoC > 30.0f) spActivoC = 30.0f; // Limita el setpoint máximo a 30.0 °C
+            if (tempAmbC < 16.0f) tempAmbC = 16.0f;   // Satura la temperatura mínima procesada a 16.0 °C
+            if (tempAmbC > 30.0f) tempAmbC = 30.0f;   // Satura la temperatura máxima procesada a 30.0 °C
+
+            float ventanaHisteresis = 3.0f; // Establece la banda muerta/diferencial térmico en 3.0 °C
+            static bool enfriando = false;  // Variable estática que almacena el estado de la máquina de estados de refrigeración
+
+            // Evaluación del termostato ON/OFF con histéresis
+            if (tempAmbC >= (spActivoC + ventanaHisteresis)) {
+                enfriando = true;  // Enciende la demanda de frío si la temp excede la consigna + 3°C
+            } 
+            else if (tempAmbC <= spActivoC) {
+                enfriando = false; // Corta la demanda de frío al alcanzar el setpoint deseado
+            }
+
+            // --- Algoritmo de Rampa Progresiva de 4 Segundos ---
+            static float dacFlotante = 0.0f; // Mantiene la precisión decimal interna entre pasadas del bucle
+            
+            const float TIEMPO_RAMPA_MS = 4000.0f; // Define el tiempo total deseado para la rampa de 0 a 100% (4000 ms)
+            const float TIEMPO_CICLO_MS = 50.0f;    // Refleja la cadencia exacta de ejecución dictada por vTaskDelay(50)
+            const float PASO_DAC = (255.0f / (TIEMPO_RAMPA_MS / TIEMPO_CICLO_MS)); // Paso incremental del DAC por cada ciclo de 50ms (aprox 3.18 unidades)
+
+            if (enfriando) {
+                dacFlotante += PASO_DAC;               // Incrementa suavemente el nivel flotante de la rampa
+                if (dacFlotante > 255.0f) dacFlotante = 255.0f; // Limita superiormente la rampa al valor máximo del DAC de 8 bits
+            } else {
+                dacFlotante -= PASO_DAC;               // Decrementa suavemente el nivel flotante de la rampa
+                if (dacFlotante < 0.0f) dacFlotante = 0.0f;     // Limita inferiormente la rampa al cero absoluto
+            }
+
+            valorDac = (uint8_t)dacFlotante; // Cast de la variable flotante a entero sin signo de 8 bits para escritura
+        } else {
+            valorDac = 0; // Fuerza la válvula a cero si no se cumplen las condiciones de modo
+        }
+
+        // 4. Control de la Salida Digital (Actuador de Ventilador DO)
+        if (manual && !automatico) { // Modo MANUAL seleccionado:
+          if (estadoVentilador && !estadoVentiladorHorarioM) {
+            digitalWrite(PIN_VENT_DO, HIGH); // Activa el ventilador con comando manual puro
+          }
+          else if (!estadoVentilador && estadoVentiladorHorarioM) {
+            digitalWrite(PIN_VENT_DO, HIGH); // Activa el ventilador con comando horario en modo manual
+          }
+          else {
+            digitalWrite(PIN_VENT_DO, LOW);  // Apaga por condición de exclusividad o doble encendido
+          }
+        } 
+        else if (!manual && automatico) { // Modo AUTOMÁTICO seleccionado:
+          digitalWrite(PIN_VENT_DO, estadoVentiladorHorario ? HIGH : LOW); // Responde estrictamente al horario global del BMS
+        } 
+        else {
+          digitalWrite(PIN_VENT_DO, LOW); // En caso de conflicto o estados no válidos del selector, mantiene la salida APAGADA
+        }
+
+        // Aplicación física de las salidas de potencia y control analógico
+        dacWrite(PIN_DAC_VALVULA, valorDac);                         // Escribe físicamente el valor (0-255) en el pin del DAC (GPIO26)
+        digitalWrite(PIN_CELDA_PELTIER, (valorDac > 0) ? HIGH : LOW); // Activa la Peltier si la válvula posee algún grado de apertura
+    } 
+    
+    // NUNCA QUITAR ESTO: Liberación explícita del procesador
+    vTaskDelay(pdMS_TO_TICKS(50)); // Pausa la tarea actual durante 50 ms para permitir la ejecución de los procesos en segundo plano
+  }
+}
