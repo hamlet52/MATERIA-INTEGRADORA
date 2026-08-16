@@ -1,0 +1,332 @@
+//Necesario aclarar que este termostato está realizado con un MAX485, si se desea realizarlo con un shield como el empleado para el controlador de la uma solo se deben modificar los pines asociados a la comunicación rs485 y los correspondientes para la entrada de los botones y sensor.
+/==============================================================================
+/ SECCIÓN 1: INCLUSIÓN DE LIBRERÍAS
+/ Explicación: Cargamos las herramientas necesarias para la pantalla OLED, 
+/ comunicación I2C/RS485, el sensor de temperatura y los botones.
+/==============================================================================
+
+#include <Wire.h>               // Librería para la comunicación I2C (usada por la pantalla OLED)
+#include <Adafruit_GFX.h>       // Librería gráfica base para dibujar texto y figuras en la pantalla
+#include <Adafruit_SSD1306.h>   // Librería específica para el controlador de pantalla OLED SSD1306
+#include <OneWire.h>            // Librería para comunicación por bus de 1 hilo (para el sensor DS18B20)
+#include <DallasTemperature.h>  // Librería para facilitar la lectura y conversión de datos del sensor DS18B20
+#include <ezButton.h>           // Librería para gestionar botones físicos y evitar rebotes táctiles
+#include <ModbusRTU.h>          // Librería para gestionar el protocolo de comunicación industrial Modbus RTU
+
+/==============================================================================
+/ SECCIÓN 2: CONFIGURACIÓN DE PANTALLA Y PINES DE HARDWARE
+/ Explicación: Definición de dimensiones, direcciones I2C, pines de conexión 
+/ y constantes del protocolo Modbus RTU.
+/==============================================================================
+
+#define SCREEN_WIDTH 128        // Ancho de la pantalla OLED en píxeles
+#define SCREEN_HEIGHT 64        // Alto de la pantalla OLED en píxeles
+#define OLED_RESET    -1        // Pin de reset para la pantalla (-1 si comparte el reset con el ESP32)
+#define SCREEN_ADDRESS 0x3C     // Dirección I2C predeterminada de la pantalla OLED
+
+// Crea el objeto para controlar la pantalla OLED indicando sus dimensiones y el bus Wire
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pin GPIO del ESP32 conectado al pin de datos (DQ) del DS18B20
+const int oneWireBus = 5;       // Se asigna el pin GPIO 5 para comunicarse con el sensor
+
+// Definición de pines para RS-485 (UART2 del ESP32)
+#define RXD2 16                 // Pin GPIO 16 configurado como Recepción (RX2) para RS-485
+#define TXD2 17                 // Pin GPIO 17 configurado como Transmisión (TX2) para RS-485
+#define PIN_RE_DE 4             // Pin GPIO 4 para controlar la dirección de envío/recepción en el módulo RS-485
+
+// Direccionamiento Modbus (Esclavo ID 2)
+#define SLAVE_ID 2              // Identificador único de este dispositivo en la red Modbus (Esclavo 2)
+#define IR_SETPOINT 1           // Dirección del Input Register 1 reservado para la temperatura objetivo (Setpoint)
+#define IR_TEMP_AMB 2           // Dirección del Input Register 2 reservado para la temperatura ambiente
+
+/==============================================================================
+/ SECCIÓN 3: INSTANCIAS DE OBJETOS Y VARIABLES GLOBALES
+/ Explicación: Declaración de objetos de comunicación, botones, semáforos 
+/ de sincronización y variables de estado del sistema.
+/==============================================================================
+
+// Instancia Modbus RTU
+ModbusRTU mb;                   // Crea el objeto encargado del procesamiento de la red Modbus
+
+// Definición de objetos ezButton asignando sus pines GPIO correspondientes
+ezButton btnSubir(12);          // Botón conectado al GPIO 12 para incrementar valor
+ezButton btnBajar(13);          // Botón conectado al GPIO 13 para decrementar valor
+ezButton btnMostrar(14);        // Botón conectado al GPIO 14 para consultar el Setpoint
+ezButton btnTempAmb(27);        // Botón conectado al GPIO 27 para consultar Temperatura Ambiente
+
+// Variables compartidas entre tareas (núcleos)
+float setpoint = 22.0f;         // Almacena la temperatura objetivo deseada (por defecto 22.0 °C)
+float tempAmbienteFloat = 0.0f; // Almacena la última temperatura real leída por el sensor
+
+// Mutex de FreeRTOS
+SemaphoreHandle_t xMutexVariables; // Objeto de control de acceso exclusivo para proteger variables compartidas
+
+// Variables de tiempo (Hold-to-Repeat)
+unsigned long tiempoUltimoCambio = 0;   // Guarda el registro de tiempo (en ms) de la última interacción
+const unsigned long retardoInicial = 1000; // Tiempo de espera configurado antes de repetir una acción mantenida
+
+// Enumeración para definir los estados de vista de la pantalla
+enum ModoPantalla { MODO_SETPOINT, MODO_TEMP_AMB };
+ModoPantalla modoActual = MODO_TEMP_AMB; // Inicia la pantalla mostrando la Temperatura Ambiente
+
+// Instancias para el sensor de temperatura
+OneWire oneWire(oneWireBus);             // Inicializa el bus OneWire usando el GPIO 5
+DallasTemperature sensors(&oneWire);     // Pasa la referencia de OneWire a la librería DallasTemperature
+
+TaskHandle_t TaskSensorHandle;            // Identificador de la tarea en segundo plano que manejará FreeRTOS
+
+// Declaración previa (prototipos) de las funciones de dibujado en pantalla
+void actualizarPantalla(int valor);
+void actualizarPantallaFloat(float valor);
+
+/==============================================================================
+/ SECCIÓN 4: TAREA PARALELA (NÚCLEO 0) - SENSOR Y MODBUS SLAVE
+/ Explicación: Esta función corre de forma independiente en el Core 0 del ESP32.
+/ Se encarga de atender peticiones Modbus y tomar la lectura del sensor sin
+/ congelar la pantalla ni la interfaz.
+/==============================================================================
+
+// --- TAREA DEL NÚCLEO 0 (SENSOR + MODBUS SLAVE) ---
+// Modificada incorporando la lógica exacta de registros y sensor del Primer Código
+void tareaSensorModbus(void * pvParameters) {
+  // 1. Inicializar Sensor DS18B20 (Lógica del primer código)
+  sensors.begin();                       // Inicia la comunicación con el sensor DS18B20
+  sensors.setResolution(12);             // Establece la precisión máxima de lectura (12 bits)
+  sensors.setWaitForConversion(false);   // EVITA CONGELAR EL CÓDIGO POR 750ms configurándolo en modo asíncrono
+  sensors.requestTemperatures();         // Lanza la primera conversión de temperatura en segundo plano
+
+  // 2. Inicializar Puerto Serie y Modbus RTU
+  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2); // Inicia el puerto de comunicación serie 2 a 9600 baudios
+  mb.begin(&Serial2, PIN_RE_DE);         // Vincula la librería Modbus al puerto Serie 2 y define el pin de dirección
+  mb.slave(SLAVE_ID);                    // Asigna el número de dirección de esclavo (2)
+
+  // 3. REGISTRAR DIRECCIONES MODBUS (Lógica del primer código)
+  // Se registran de forma obligatoria e incondicional al inicio
+  mb.addIreg(IR_SETPOINT, 0);            // Crea el Registro de Entrada 1 con valor inicial 0
+  mb.addIreg(IR_TEMP_AMB, 0);            // Crea el Registro de Entrada 2 con valor inicial 0
+
+  unsigned long ultimaLecturaSensor = 0;  // Variable local para llevar la cuenta del tiempo de refresco del sensor
+
+  while(true) {                          // Bucle infinito propio de la tarea en FreeRTOS
+    // A. Atender peticiones del Master de forma continua
+    mb.task();                           // Procesa las solicitudes de lectura/escritura recibidas por RS-485
+
+    // B. Lectura del sensor cada 1000 ms
+    if (millis() - ultimaLecturaSensor >= 1000) { // Evalúa si ha transcurrido 1 segundo
+      ultimaLecturaSensor = millis();    // Actualiza la marca de tiempo
+
+      // Leer temperatura de la conversión solicitada previamente
+      float tempLeida = sensors.getTempCByIndex(0); // Obtiene la temperatura en Celsius del primer sensor conectado
+      
+      // Solicitar inmediatamente la siguiente lectura en segundo plano
+      sensors.requestTemperatures();     // Dispara la siguiente medición para que esté lista dentro de 1 segundo
+
+      // Validar si la lectura del sensor es válida
+      if (tempLeida != DEVICE_DISCONNECTED_C && tempLeida > -55.0f) { // Verifica que no haya desconexiones ni errores
+        if (xSemaphoreTake(xMutexVariables, pdMS_TO_TICKS(10)) == pdTRUE) { // Pide permiso para usar la variable global
+          tempAmbienteFloat = tempLeida;  // Actualiza el valor global de la temperatura ambiente
+          xSemaphoreGive(xMutexVariables); // Libera el bloqueo para que otras tareas la puedan leer
+        }
+      }
+    }
+
+    // C. Actualizar valores en los Input Registers de Modbus (Lógica del primer código)
+    if (xSemaphoreTake(xMutexVariables, pdMS_TO_TICKS(5)) == pdTRUE) { // Pide el cerrojo de protección de variables
+      int sp_modbus   = (int)(setpoint * 100.0f);        // Escala el setpoint multiplicándolo por 100 (ej: 22.50 -> 2250)
+      int temp_modbus = (int)(tempAmbienteFloat * 100.0f); // Escala la temperatura multiplicándola por 100
+      xSemaphoreGive(xMutexVariables);                   // Libera el permiso de acceso a variables
+
+      mb.Ireg(IR_SETPOINT, sp_modbus);   // Carga el setpoint escalado en el registro Modbus correspondientes
+      mb.Ireg(IR_TEMP_AMB, temp_modbus); // Carga la temperatura escalada en el registro Modbus correspondientes
+    }
+
+    // Pequeña pausa para ceder control al Watchdog / RTOS
+    vTaskDelay(pdMS_TO_TICKS(2));        // Entrega un brevísimo tiempo al sistema operativo para mantener la estabilidad
+  }
+}
+
+/==============================================================================
+/ SECCIÓN 5: CONFIGURACIÓN INICIAL (SETUP)
+/ Explicación: Se ejecuta una sola vez al encender el ESP32. Inicializa 
+/ la consola, pines, la pantalla, el Mutex y crea la tarea paralela.
+/==============================================================================
+
+void setup() {
+  Serial.begin(115200);                  // Abre el puerto serie principal para enviar mensajes de depuración a la PC
+  delay(1000);                           // Pausa de 1 segundo para asegurar la estabilidad del voltaje de inicio
+  Wire.begin(21, 22);                    // Inicializa el bus I2C asignando SDA al GPIO 21 y SCL al GPIO 22
+  
+  pinMode(12, INPUT_PULLDOWN);           // Configura el GPIO 12 como entrada usando resistencia a tierra interna
+  pinMode(13, INPUT_PULLDOWN);           // Configura el GPIO 13 como entrada usando resistencia a tierra interna
+  pinMode(14, INPUT_PULLDOWN);           // Configura el GPIO 14 como entrada usando resistencia a tierra interna
+  pinMode(27, INPUT_PULLDOWN);           // Configura el GPIO 27 como entrada usando resistencia a tierra interna
+
+  xMutexVariables = xSemaphoreCreateMutex(); // Crea mecánicamente el Mutex de protección para variables
+  if (xMutexVariables == NULL) {         // Evalúa si no hubo memoria suficiente para instanciar el Mutex
+    Serial.println(F("Error al crear el Mutex de FreeRTOS")); // Muestra el mensaje de fallo por consola
+    for(;;);                             // Congela la ejecución del programa mediante un bucle sin fin
+  }
+
+  btnSubir.setDebounceTime(50);          // Establece 50ms de filtro antirrebote para el botón de subida
+  btnBajar.setDebounceTime(50);          // Establece 50ms de filtro antirrebote para el botón de bajada
+  btnMostrar.setDebounceTime(50);        // Establece 50ms de filtro antirrebote para el botón de setpoint
+  btnTempAmb.setDebounceTime(50);        // Establece 50ms de filtro antirrebote para el botón de ambiente
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) { // Inicializa el hardware de la pantalla OLED
+    Serial.println(F("Fallo al iniciar SSD1306")); // Notifica por consola si la pantalla no responde
+    for(;;);                             // Congela el programa si falla la pantalla
+  }
+
+  // Crear tarea exclusiva en el Núcleo 0
+  xTaskCreatePinnedToCore(
+    tareaSensorModbus,        // Función que ejecutará la tarea
+    "TaskSensorModbus",       // Nombre descriptivo interno para la tarea
+    4096,                     // Tamaño de la pila (Stack) asignada a la tarea en bytes
+    NULL,                     // Parámetros de entrada pasados a la tarea (ninguno)
+    1,                        // Prioridad asignada a la tarea (1 = Prioridad normal)
+    &TaskSensorHandle,        // Puntero para referenciar la tarea
+    0                         // Identificador del Núcleo procesador asignado (Núcleo 0)
+  );
+
+  actualizarPantallaFloat(tempAmbienteFloat); // Renderiza la pantalla inicial cargando la temperatura ambiente
+}
+
+/==============================================================================
+/ SECCIÓN 6: BUCLE PRINCIPAL (LOOP - NÚCLEO 1)
+/ Explicación: Corre en el Core 1. Gestiona la lógica de la interfaz de usuario,
+/ monitorea la lectura de los botones físicos y dibuja las actualizaciones en la OLED.
+/==============================================================================
+
+void loop() {
+  // Manejo de botones e interfaz en NÚCLEO 1
+  btnSubir.loop();                       // Lee y procesa los cambios de estado eléctrico del botón Subir
+  btnBajar.loop();                       // Lee y procesa los cambios de estado eléctrico del botón Bajar
+  btnMostrar.loop();                     // Lee y procesa el estado del botón de consulta de Setpoint
+  btnTempAmb.loop();                     // Lee y procesa el estado del botón de consulta de Temp. Ambiente
+
+  static float ultimaTempMostrada = -999.0; // Variable que conserva la última cifra mostrada para evitar redibujados
+  if (modoActual == MODO_TEMP_AMB) {     // Solo entra si la pantalla está configurada en vista ambiente
+    float tempActualLocal = tempAmbienteFloat; // Copia local inicial
+    if (xSemaphoreTake(xMutexVariables, (TickType_t)10) == pdTRUE) { // Solicita permiso para acceder a la variable
+      tempActualLocal = tempAmbienteFloat; // Extrae el valor actualizado de la temperatura tomada en el Núcleo 0
+      xSemaphoreGive(xMutexVariables);   // Suelta el semáforo de protección
+    }
+    
+    if (abs(tempActualLocal - ultimaTempMostrada) >= 0.1) { // Redibuja solo si la diferencia es de al menos 0.1 °C
+      ultimaTempMostrada = tempActualLocal; // Actualiza el registro de la última cifra dibujada
+      actualizarPantallaFloat(tempActualLocal); // Muestra el nuevo valor numérico en la pantalla OLED
+    }
+  }
+
+/==============================================================================
+/ SECCIÓN 7: CONTROL DE EVENTOS DE BOTONES
+/ Explicación: Bloques condicionales que responden al pulso de los 4 botones
+/ modificando la interfaz y los valores de configuración.
+/==============================================================================
+
+  // --- BOTÓN 2: SUBIR SETPOINT ---
+  if (btnSubir.isPressed()) {            // Detecta la acción de presionar el botón de Subir
+    modoActual = MODO_SETPOINT;          // Cambia la vista activa de la pantalla al modo Setpoint
+    if (xSemaphoreTake(xMutexVariables, (TickType_t)10) == pdTRUE) { // Adquiere acceso exclusivo a la variable
+      if (setpoint < 30) {               // Aplica el límite máximo permitido (30 °C)
+        setpoint++;                      // Incrementa en 1 unidad el valor del Setpoint
+        actualizarPantalla((int)setpoint); // Dibuja de inmediato el nuevo Setpoint en la pantalla OLED
+      }
+      xSemaphoreGive(xMutexVariables);   // Otorga el acceso a la variable
+    }
+    tiempoUltimoCambio = millis();       // Guarda la hora exacta del cambio
+  }
+
+  // --- BOTÓN 1: BAJAR SETPOINT ---
+  if (btnBajar.isPressed()) {            // Detecta la acción de presionar el botón de Bajar
+    modoActual = MODO_SETPOINT;          // Cambia la vista de pantalla al modo Setpoint
+    if (xSemaphoreTake(xMutexVariables, (TickType_t)10) == pdTRUE) { // Adquiere acceso a la variable compartida
+      if (setpoint > 16) {               // Aplica el límite mínimo permitido (16 °C)
+        setpoint--;                      // Decrementa en 1 unidad el valor del Setpoint
+        actualizarPantalla((int)setpoint); // Dibuja el nuevo Setpoint resultante en la pantalla
+      }
+      xSemaphoreGive(xMutexVariables);   // Libera el candado de protección
+    }
+    tiempoUltimoCambio = millis();       // Actualiza la marca de tiempo de interacción
+  }
+
+  // --- BOTÓN 3: MOSTRAR SETPOINT ---
+  if (btnMostrar.isPressed()) {          // Detecta el pulso sobre el botón Mostrar Setpoint
+    modoActual = MODO_SETPOINT;          // Selecciona el modo de pantalla Setpoint
+    int currentSetpoint = (int)setpoint; // Lee una copia local previa
+    if (xSemaphoreTake(xMutexVariables, (TickType_t)10) == pdTRUE) { // Inicia consulta segura por Mutex
+      currentSetpoint = (int)setpoint;   // Captura el valor protegido de setpoint
+      xSemaphoreGive(xMutexVariables);   // Devuelve los permisos sobre la variable
+    }
+    actualizarPantalla(currentSetpoint); // Imprime el valor entero del Setpoint en la pantalla
+  }
+
+  // --- BOTÓN 4: MOSTRAR TEMPERATURA AMBIENTE ---
+  if (btnTempAmb.isPressed()) {          // Detecta el pulso sobre el botón Mostrar Temperatura Ambiente
+    modoActual = MODO_TEMP_AMB;          // Selecciona el modo de pantalla Temperatura Ambiente
+    float currentTemp = tempAmbienteFloat; // Realiza una lectura de respaldo
+    if (xSemaphoreTake(xMutexVariables, (TickType_t)10) == pdTRUE) { // Abre la puerta de acceso protegido
+      currentTemp = tempAmbienteFloat;   // Copia la temperatura ambiente del sensor
+      xSemaphoreGive(xMutexVariables);   // Cierra la puerta de acceso
+    }
+    actualizarPantallaFloat(currentTemp); // Pinta en la OLED el valor decimal de la temperatura ambiente
+    ultimaTempMostrada = currentTemp;    // Actualiza la referencia para evitar parpadeos no deseados
+  }
+  
+  vTaskDelay(pdMS_TO_TICKS(10));         // Pausa de 10ms que permite trabajar de forma suave al procesador
+}
+
+/==============================================================================
+/ SECCIÓN 8: FUNCIONES AUXILIARES DE RENDERIZADO EN PANTALLA
+/ Explicación: Métodos encargados de borrar la pantalla y dibujar la interfaz 
+/ gráfica para números enteros (Setpoint) o flotantes (Temp. Ambiente).
+/==============================================================================
+
+// --- DIBUJADO DE PANTALLA OLED ---
+
+void actualizarPantalla(int valor) {
+  display.clearDisplay();                // Limpia por completo la memoria del buffer gráfico de la pantalla
+  
+  // Encabezado
+  display.setTextSize(1);                // Establece tamaño de fuente pequeño (Normal/1)
+  display.setTextColor(SSD1306_WHITE);   // Asigna color blanco a los píxeles
+  display.setCursor(40, 2);              // Posiciona el cursor de dibujo en la coordenada X=40, Y=2
+  display.print("SETPOINT");             // Imprime el texto estático de la cabecera
+
+  display.drawFastHLine(0, 12, 128, SSD1306_WHITE); // Traza una línea horizontal divisoria de lado a lado
+
+  // Valor
+  display.setTextSize(3);                // Cambia el tamaño de fuente a grande (3) para resaltar la cifra
+  display.setCursor(30, 26);             // Coloca el cursor en la coordenada X=30, Y=26
+  display.print(valor);                  // Muestra el número entero del Setpoint
+  display.write(247);                    // Dibuja mediante código ASCII el símbolo de grados (°)
+  display.print("C");                    // Imprime la letra 'C' de Celsius
+  
+  display.display();                     // Envía todos los comandos e imágenes acumulados a la pantalla OLED
+}
+
+/==============================================================================
+/ SECCIÓN 9: DIBUJADO DE TEMPERATURA AMBIENTE (CON DECIMALES)
+/==============================================================================
+
+void actualizarPantallaFloat(float valor) {
+  display.clearDisplay();                // Borra el mapa de píxeles actual para redibujar de cero
+  
+  // Encabezado
+  display.setTextSize(1);                // Establece el tamaño de texto pequeño (1)
+  display.setTextColor(SSD1306_WHITE);   // Define el color de letra como blanco
+  display.setCursor(24, 2);              // Posiciona el cursor en la coordenada X=24, Y=2
+  display.print("TEMP. AMBIENTE");       // Imprime el texto del encabezado
+
+  display.drawFastHLine(0, 12, 128, SSD1306_WHITE); // Dibuja la línea decorativa horizontal
+
+  // Valor
+  display.setTextSize(3);                // Selecciona el tamaño de fuente muy grande (3)
+  display.setCursor(5, 26);              // Posiciona el texto en la coordenada X=5, Y=26
+  display.print(valor, 1);               // Imprime el número flotante formateado a exactamente 1 decimal
+  display.write(247);                    // Escribe el carácter símbolo de grados (°)
+  display.print("C");                    // Imprime la letra 'C'
+  
+  display.display();                     // Hace efectiva la actualización visual en el módulo físico OLED
+}
